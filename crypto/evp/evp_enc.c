@@ -57,6 +57,8 @@
  */
 
 #include <stdio.h>
+#include <limits.h>
+#include <assert.h>
 #include "cryptlib.h"
 #include <openssl/evp.h>
 #include <openssl/err.h>
@@ -304,6 +306,44 @@ int EVP_DecryptInit_ex(EVP_CIPHER_CTX *ctx, const EVP_CIPHER *cipher, ENGINE *im
 	return EVP_CipherInit_ex(ctx, cipher, impl, key, iv, 0);
 	}
 
+/*
+ * According to the letter of standard difference between pointers
+ * is specified to be valid only within same object. This makes
+ * it formally challenging to determine if input and output buffers
+ * are not partially overlapping with standard pointer arithmetic.
+ */
+#ifdef PTRDIFF_T
+# undef PTRDIFF_T
+#endif
+#if defined(OPENSSL_SYS_VMS) && __INITIAL_POINTER_SIZE==64
+/*
+ * Then we have VMS that distinguishes itself by adhering to
+ * sizeof(size_t)==4 even in 64-bit builds, which means that
+ * difference between two pointers might be truncated to 32 bits.
+ * In the context one can even wonder how comparison for
+ * equality is implemented. To be on the safe side we adhere to
+ * PTRDIFF_T even for comparison for equality.
+ */
+# define PTRDIFF_T uint64_t
+#else
+# define PTRDIFF_T size_t
+#endif
+
+static int is_partially_overlapping(const void *ptr1, const void *ptr2,
+                                    int len)
+{
+    PTRDIFF_T diff = (PTRDIFF_T)ptr1-(PTRDIFF_T)ptr2;
+    /*
+     * Check for partially overlapping buffers. [Binary logical
+     * operations are used instead of boolean to minimize number
+     * of conditional branches.]
+     */
+    int overlapped = (len > 0) & (diff != 0) & ((diff < (PTRDIFF_T)len) |
+                                                (diff > (0 - (PTRDIFF_T)len)));
+    assert(!overlapped);
+    return overlapped;
+}
+
 int EVP_EncryptUpdate(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl,
 	     const unsigned char *in, int inl)
 	{
@@ -311,6 +351,11 @@ int EVP_EncryptUpdate(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl,
 
 	if (ctx->cipher->flags & EVP_CIPH_FLAG_CUSTOM_CIPHER)
 		{
+	    if (is_partially_overlapping(out, in, inl)) {
+                EVPerr(EVP_F_EVP_ENCRYPTUPDATE, EVP_R_PARTIALLY_OVERLAPPING);
+	        return 0;
+	    }
+
 		i = M_do_cipher(ctx, out, in, inl);
 		if (i < 0)
 			return 0;
@@ -324,6 +369,10 @@ int EVP_EncryptUpdate(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl,
 		*outl = 0;
 		return inl == 0;
 		}
+	if (is_partially_overlapping(out, in, inl)) {
+            EVPerr(EVP_F_EVP_ENCRYPTUPDATE, EVP_R_PARTIALLY_OVERLAPPING);
+	    return 0;
+        }
 
 	if(ctx->buf_len == 0 && (inl&(ctx->block_mask)) == 0)
 		{
@@ -343,8 +392,7 @@ int EVP_EncryptUpdate(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl,
 	OPENSSL_assert(bl <= (int)sizeof(ctx->buf));
 	if (i != 0)
 		{
-		if (i+inl < bl)
-			{
+		if (bl - i > inl) {
 			memcpy(&(ctx->buf[i]),in,inl);
 			ctx->buf_len+=inl;
 			*outl=0;
@@ -353,10 +401,28 @@ int EVP_EncryptUpdate(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl,
 		else
 			{
 			j=bl-i;
+
+			/*
+			 * Once we've processed the first j bytes from in, the amount of
+			 * data left that is a multiple of the block length is:
+                         * (inl - j) & ~(bl - 1)
+                         * We must ensure that this amount of data, plus the one block that
+                         * we process from ctx->buf does not exceed INT_MAX
+                         */
+                        if (((inl - j) & ~(bl - 1)) > INT_MAX - bl) {
+                            EVPerr(EVP_F_EVP_ENCRYPTDECRYPTUPDATE,
+                                   EVP_R_OUTPUT_WOULD_OVERFLOW);
+			    return 0;
+			}
 			memcpy(&(ctx->buf[i]),in,j);
-			if(!M_do_cipher(ctx,out,ctx->buf,bl)) return 0;
 			inl-=j;
 			in+=j;
+			if (is_partially_overlapping(out, in, bl)) {
+	                    EVPerr(EVP_F_EVP_ENCRYPTUPDATE, EVP_R_PARTIALLY_OVERLAPPING);
+			    return 0;
+			}
+			if(!M_do_cipher(ctx,out,ctx->buf,bl))
+			   return 0;
 			out+=bl;
 			*outl=bl;
 			}
@@ -438,6 +504,11 @@ int EVP_DecryptUpdate(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl,
 
 	if (ctx->cipher->flags & EVP_CIPH_FLAG_CUSTOM_CIPHER)
 		{
+	    if (is_partially_overlapping(out, in, inl)) {
+                EVPerr(EVP_F_EVP_DECRYPTUPDATE, EVP_R_PARTIALLY_OVERLAPPING);
+	        return 0;
+	    }
+
 		fix_len = M_do_cipher(ctx, out, in, inl);
 		if (fix_len < 0)
 			{
@@ -463,6 +534,25 @@ int EVP_DecryptUpdate(EVP_CIPHER_CTX *ctx, unsigned char *out, int *outl,
 
 	if(ctx->final_used)
 		{
+		/*
+		 * final_used is only ever set if buf_len is 0. Therefore the maximum
+	         * length output we will ever see from evp_EncryptDecryptUpdate is
+	         * the maximum multiple of the block length that is <= inl, or just:
+	         * inl & ~(b - 1)
+	         * Since final_used has been set then the final output length is:
+	         * (inl & ~(b - 1)) + b
+	         * This must never exceed INT_MAX
+	         */
+	        if ((inl & ~(b - 1)) > INT_MAX - b) {
+	            EVPerr(EVP_F_EVP_DECRYPTUPDATE, EVP_R_OUTPUT_WOULD_OVERFLOW);
+	            return 0;
+	        }
+	   /* see comment about PTRDIFF_T comparison above */
+           if (((PTRDIFF_T)out == (PTRDIFF_T)in)
+               || is_partially_overlapping(out, in, b)) {
+               EVPerr(EVP_F_EVP_DECRYPTUPDATE, EVP_R_PARTIALLY_OVERLAPPING);
+               return 0;
+           }
 		memcpy(out,ctx->final,b);
 		out+=b;
 		fix_len = 1;
