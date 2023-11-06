@@ -1,6 +1,6 @@
 /* ssl/ssl_err.c */
 /* ====================================================================
- * Copyright (c) 1999-2011 The OpenSSL Project.  All rights reserved.
+ * Copyright (c) 1999-2016 The OpenSSL Project.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -92,6 +92,7 @@ static ERR_STRING_DATA SSL_str_functs[]=
 {ERR_FUNC(SSL_F_DTLS1_HEARTBEAT),	"DTLS1_HEARTBEAT"},
 {ERR_FUNC(SSL_F_DTLS1_OUTPUT_CERT_CHAIN),	"DTLS1_OUTPUT_CERT_CHAIN"},
 {ERR_FUNC(SSL_F_DTLS1_PREPROCESS_FRAGMENT),	"DTLS1_PREPROCESS_FRAGMENT"},
+{ERR_FUNC(SSL_F_DTLS1_PROCESS_BUFFERED_RECORDS),	"DTLS1_PROCESS_BUFFERED_RECORDS"},
 {ERR_FUNC(SSL_F_DTLS1_PROCESS_OUT_OF_SEQ_MESSAGE),	"DTLS1_PROCESS_OUT_OF_SEQ_MESSAGE"},
 {ERR_FUNC(SSL_F_DTLS1_PROCESS_RECORD),	"DTLS1_PROCESS_RECORD"},
 {ERR_FUNC(SSL_F_DTLS1_READ_BYTES),	"DTLS1_READ_BYTES"},
@@ -329,6 +330,7 @@ static ERR_STRING_DATA SSL_str_reasons[]=
 {ERR_REASON(SSL_R_BAD_SRP_B_LENGTH)      ,"bad srp b length"},
 {ERR_REASON(SSL_R_BAD_SRP_G_LENGTH)      ,"bad srp g length"},
 {ERR_REASON(SSL_R_BAD_SRP_N_LENGTH)      ,"bad srp n length"},
+{ERR_REASON(SSL_R_BAD_SRP_PARAMETERS)    ,"bad srp parameters"},
 {ERR_REASON(SSL_R_BAD_SRP_S_LENGTH)      ,"bad srp s length"},
 {ERR_REASON(SSL_R_BAD_SRTP_MKI_VALUE)    ,"bad srtp mki value"},
 {ERR_REASON(SSL_R_BAD_SRTP_PROTECTION_PROFILE_LIST),"bad srtp protection profile list"},

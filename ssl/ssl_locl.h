@@ -1174,4 +1174,6 @@ void tls_fips_digest_extra(
 	const EVP_CIPHER_CTX *cipher_ctx, EVP_MD_CTX *mac_ctx,
 	const unsigned char *data, size_t data_len, size_t orig_len);
 
+int srp_verify_server_param(SSL *s, int *al);
+
 #endif

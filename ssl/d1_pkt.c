@@ -178,7 +178,7 @@ static int dtls1_record_needs_buffering(SSL *s, SSL3_RECORD *rr,
 #endif
 static int dtls1_buffer_record(SSL *s, record_pqueue *q,
 	unsigned char *priority);
-static int dtls1_process_record(SSL *s);
+static int dtls1_process_record(SSL *s, DTLS1_BITMAP *bitmap);
 
 /* copy buffered record into SSL structure */
 static int
@@ -212,7 +212,7 @@ dtls1_buffer_record(SSL *s, record_pqueue *queue, unsigned char *priority)
 	/* Limit the size of the queue to prevent DOS attacks */
 	if (pqueue_size(queue->q) >= 100)
 		return 0;
-		
+
 	rdata = OPENSSL_malloc(sizeof(DTLS1_RECORD_DATA));
 	item = pitem_new(priority, rdata);
 	if (rdata == NULL || item == NULL)
@@ -239,14 +239,6 @@ dtls1_buffer_record(SSL *s, record_pqueue *queue, unsigned char *priority)
 	}
 #endif
 
-	/* insert should not fail, since duplicates are dropped */
-	if (pqueue_insert(queue->q, item) == NULL)
-		{
-		OPENSSL_free(rdata);
-		pitem_free(item);
-		return(0);
-		}
-
 	s->packet = NULL;
 	s->packet_length = 0;
 	memset(&(s->s3->rbuf), 0, sizeof(SSL3_BUFFER));
@@ -255,11 +247,24 @@ dtls1_buffer_record(SSL *s, record_pqueue *queue, unsigned char *priority)
 	if (!ssl3_setup_buffers(s))
 		{
 		SSLerr(SSL_F_DTLS1_BUFFER_RECORD, ERR_R_INTERNAL_ERROR);
+		if (rdata->rbuf.buf != NULL)
+			OPENSSL_free(rdata->rbuf.buf);
 		OPENSSL_free(rdata);
 		pitem_free(item);
-		return(0);
+		return(-1);
 		}
-	
+
+	/* insert should not fail, since duplicates are dropped */
+	if (pqueue_insert(queue->q, item) == NULL)
+		{
+		SSLerr(SSL_F_DTLS1_BUFFER_RECORD, ERR_R_INTERNAL_ERROR);
+		if (rdata->rbuf.buf != NULL)
+			OPENSSL_free(rdata->rbuf.buf);
+		OPENSSL_free(rdata);
+		pitem_free(item);
+		return(-1);
+		}
+
 	return(1);
 	}
 
@@ -299,22 +304,71 @@ static int
 dtls1_process_buffered_records(SSL *s)
     {
     pitem *item;
+    SSL3_BUFFER *rb;
+    SSL3_RECORD *rr;
+    DTLS1_BITMAP *bitmap;
+    unsigned int is_next_epoch;
+    int replayok = 1;
     
     item = pqueue_peek(s->d1->unprocessed_rcds.q);
     if (item)
         {
         /* Check if epoch is current. */
         if (s->d1->unprocessed_rcds.epoch != s->d1->r_epoch)
-            return(1);  /* Nothing to do. */
+            return 1;         /* Nothing to do. */
+
+        rb = &s->s3->rbuf;
+
+        if (rb->left > 0) {
+            /*
+             * We've still got data from the current packet to read. There could
+             * be a record from the new epoch in it - so don't overwrite it
+             * with the unprocessed records yet (we'll do it when we've
+             * finished reading the current packet).
+             */
+            return 1;
+        }
+
         
         /* Process all the records. */
         while (pqueue_peek(s->d1->unprocessed_rcds.q))
             {
             dtls1_get_unprocessed_record(s);
-            if ( ! dtls1_process_record(s))
-                return(0);
-            dtls1_buffer_record(s, &(s->d1->processed_rcds), 
-                s->s3->rrec.seq_num);
+            bitmap = dtls1_get_bitmap(s, rr, &is_next_epoch);
+            if (bitmap == NULL) {
+                /*
+                 * Should not happen. This will only ever be NULL when the
+                 * current record is from a different epoch. But that cannot
+                 * be the case because we already checked the epoch above
+                 */
+                 SSLerr(SSL_F_DTLS1_PROCESS_BUFFERED_RECORDS,
+                        ERR_R_INTERNAL_ERROR);
+                 return 0;
+            }
+#ifndef OPENSSL_NO_SCTP
+            /* Only do replay check if no SCTP bio */
+            if (!BIO_dgram_is_sctp(SSL_get_rbio(s)))
+#endif
+            {
+                /*
+                 * Check whether this is a repeat, or aged record. We did this
+                 * check once already when we first received the record - but
+                 * we might have updated the window since then due to
+                 * records we subsequently processed.
+                 */
+                replayok = dtls1_record_replay_check(s, bitmap);
+            }
+
+            if (!replayok || !dtls1_process_record(s, bitmap)) {
+                /* dump this record */
+                rr->length = 0;
+                s->packet_length = 0;
+                continue;
+            }
+
+            if(dtls1_buffer_record(s, &(s->d1->processed_rcds),
+                s->s3->rrec.seq_num)<0)
+                return 0;
             }
         }
 
@@ -323,7 +377,7 @@ dtls1_process_buffered_records(SSL *s)
     s->d1->processed_rcds.epoch = s->d1->r_epoch;
     s->d1->unprocessed_rcds.epoch = s->d1->r_epoch + 1;
 
-    return(1);
+    return 1;
     }
 
 
@@ -372,8 +426,7 @@ dtls1_get_buffered_record(SSL *s)
 
 #endif
 
-static int
-dtls1_process_record(SSL *s)
+static int dtls1_process_record(SSL *s, DTLS1_BITMAP *bitmap)
 {
 	int i,al;
 	int enc_err;
@@ -529,7 +582,10 @@ printf("\n");
 
 	/* we have pulled in a full packet so zero things */
 	s->packet_length=0;
-	dtls1_record_bitmap_update(s, &(s->d1->bitmap));/* Mark receipt of record. */
+
+	/* Mark receipt of record. */
+	dtls1_record_bitmap_update(s, bitmap);
+
 	return(1);
 
 f_err:
@@ -560,16 +616,17 @@ int dtls1_get_record(SSL *s)
 
 	rr= &(s->s3->rrec);
 
+again:
 	/* The epoch may have changed.  If so, process all the
 	 * pending records.  This is a non-blocking operation. */
-	dtls1_process_buffered_records(s);
+	if (!dtls1_process_buffered_records(s))
+		return -1;
 
 	/* if we're renegotiating, then there may be buffered records */
 	if (dtls1_get_processed_record(s))
 		return 1;
 
 	/* get something from the wire */
-again:
 	/* check if we have the header */
 	if (	(s->rstate != SSL_ST_READ_BODY) ||
 		(s->packet_length < DTLS1_RT_HEADER_LENGTH)) 
@@ -700,14 +757,15 @@ again:
 		{
 		if ((SSL_in_init(s) || s->in_handshake) && !s->d1->listen)
 			{
-			dtls1_buffer_record(s, &(s->d1->unprocessed_rcds), rr->seq_num);
+			if(dtls1_buffer_record(s, &(s->d1->unprocessed_rcds), rr->seq_num)<0)
+				return -1;
 			}
 		rr->length = 0;
 		s->packet_length = 0;
 		goto again;
 		}
 
-	if (!dtls1_process_record(s))
+	if (!dtls1_process_record(s, bitmap))
 		{
 		rr->length = 0;
 		s->packet_length = 0;  /* dump this record */
@@ -864,7 +922,11 @@ start:
 		 * buffer the application data for later processing rather
 		 * than dropping the connection.
 		 */
-		dtls1_buffer_record(s, &(s->d1->buffered_app_data), rr->seq_num);
+		if(dtls1_buffer_record(s, &(s->d1->buffered_app_data), rr->seq_num)<0)
+			{
+			SSLerr(SSL_F_DTLS1_READ_BYTES, ERR_R_INTERNAL_ERROR);
+			return -1;
+			}
 		rr->length = 0;
 		goto start;
 		}
@@ -1799,8 +1861,13 @@ dtls1_get_bitmap(SSL *s, SSL3_RECORD *rr, unsigned int *is_next_epoch)
     if (rr->epoch == s->d1->r_epoch)
         return &s->d1->bitmap;
 
-    /* Only HM and ALERT messages can be from the next epoch */
+    /*
+     * Only HM and ALERT messages can be from the next epoch and only if we
+     * have already processed all of the unprocessed records from the last
+     * epoch
+     */
     else if (rr->epoch == (unsigned long)(s->d1->r_epoch + 1) &&
+	s->d1->unprocessed_rcds.epoch != s->d1->r_epoch &&
         (rr->type == SSL3_RT_HANDSHAKE ||
             rr->type == SSL3_RT_ALERT))
         {

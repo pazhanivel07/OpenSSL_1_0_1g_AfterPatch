@@ -673,6 +673,7 @@ int ssl3_accept(SSL *s)
 		case SSL3_ST_SR_CERT_VRFY_A:
 		case SSL3_ST_SR_CERT_VRFY_B:
 
+			s->s3->flags |= SSL3_FLAGS_CCS_OK;
 			/* we should decide if we expected this one */
 			ret=ssl3_get_cert_verify(s);
 			if (ret <= 0) goto end;
@@ -700,6 +701,7 @@ int ssl3_accept(SSL *s)
 
 		case SSL3_ST_SR_FINISHED_A:
 		case SSL3_ST_SR_FINISHED_B:
+			s->s3->flags |= SSL3_FLAGS_CCS_OK;
 			ret=ssl3_get_finished(s,SSL3_ST_SR_FINISHED_A,
 				SSL3_ST_SR_FINISHED_B);
 			if (ret <= 0) goto end;
@@ -770,7 +772,10 @@ int ssl3_accept(SSL *s)
 				s->s3->tmp.next_state=SSL3_ST_SR_FINISHED_A;
 #else
 				if (s->s3->next_proto_neg_seen)
+					{
+					s->s3->flags |= SSL3_FLAGS_CCS_OK;
 					s->s3->tmp.next_state=SSL3_ST_SR_NEXT_PROTO_A;
+					}
 				else
 					s->s3->tmp.next_state=SSL3_ST_SR_FINISHED_A;
 #endif
@@ -2784,6 +2789,13 @@ int ssl3_get_client_key_exchange(SSL *s)
 				{
 				SSLerr(SSL_F_SSL3_GET_CLIENT_KEY_EXCHANGE,ERR_R_BN_LIB);
 				goto err;
+				}
+			if (BN_ucmp(s->srp_ctx.A, s->srp_ctx.N) >= 0
+				|| BN_is_zero(s->srp_ctx.A))
+				{
+				al=SSL_AD_ILLEGAL_PARAMETER;
+				SSLerr(SSL_F_SSL3_GET_CLIENT_KEY_EXCHANGE,SSL_R_BAD_SRP_PARAMETERS);
+				goto f_err;
 				}
 			if (s->session->srp_username != NULL)
 				OPENSSL_free(s->session->srp_username);
